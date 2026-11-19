@@ -177,3 +177,33 @@ production monitoring, all with Langfuse.
 |---|---|---|
 | Card | `components/copper/release-health.tsx` | An empty card on the Refund Console that asks "Is Ask Copper safe to ship?" |
 
+
+## Module 5: Langfuse tracing (cost and latency)
+
+**Summary:** With the Langfuse keys set, every model call is also sent to
+Langfuse as a trace: each step, each tool call, the tokens, the cost and how
+long it took. Without the keys the app behaves exactly as before.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Tracing | `lib/ai/langfuse.ts` | `startLangfuse()` sets up tracing once, on the first model call, if `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set. `labelled()` names a trace after its feature and tags it with the feature and `module-N`. `traced()` groups several calls into one trace |
+| Wrapper | `lib/ai/call.ts` | `callText`, `callObject`, `callStream` and `callEmbedMany` run inside `labelled()`, so nothing else in the app needs to know about Langfuse |
+| Cost | `lib/ai/pricing.ts` (`costDetails`) | The app's own price for each model call is put on its span, so the cost in Langfuse matches the `[ai_calls]` log, even for a model Langfuse has no price for |
+| Ask Copper turn | `lib/copper/assistant/ask.ts` | One trace per turn, `ask-copper-turn`: Copper's call and, after a handoff, the Refund Desk's call sit inside it, so the turn shows its total cost and latency |
+| Packages | `@langfuse/vercel-ai-sdk`, `@langfuse/otel`, `@langfuse/tracing`, `@opentelemetry/sdk-trace-node` | Langfuse's integration for AI SDK 7. `@ai-sdk/otel` is pinned (in `overrides`) to the version that matches `ai` |
+
+**Data flow:** model call → `lib/ai/call.ts` → AI SDK telemetry → spans →
+`CostSpanProcessor` adds the cost → `LangfuseSpanProcessor` → Langfuse
+(`LANGFUSE_BASE_URL`). In Langfuse, filter traces by the tag `ask-copper`,
+`refund-desk`, `search-docs` or `module-4` to compare cost and latency.
+
+**Decisions and trade-offs:** Tracing starts lazily in the wrapper, not in
+`instrumentation.ts`, so scripts (`npm run embed-docs`, and the eval to come)
+are traced the same way as the app. The `[ai_calls]` terminal log stays: it
+needs no account. Traces are sent after the reply, so tracing adds no wait for
+the customer; on Vercel they are sent immediately instead of in batches.
+
+**Risks and open questions:** Traces include the customer's question and the
+reply, so real personal data would go to Langfuse. Embedding calls show
+latency but no tokens or cost (Google doesn't report them). If Langfuse is
+unreachable, traces are dropped silently and the app keeps working.

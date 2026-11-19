@@ -8,11 +8,14 @@ import {
   MODELS,
   type ModelId,
 } from "@/lib/ai/models";
+import { flushLangfuse, isTraceRoot, labelled } from "@/lib/ai/langfuse";
 import { costUsd } from "@/lib/ai/pricing";
 
 // Every model call in the app goes through this file, so each one is logged
 // with its tokens, cost and how long it took. The log goes to the terminal
 // running the app, as a line starting "[ai_calls]".
+// Module 5: with the Langfuse keys set, each call is also traced in Langfuse
+// (steps, tool calls, tokens, cost and latency); see lib/ai/langfuse.ts.
 
 export class AiNotConfiguredError extends Error {
   constructor() {
@@ -101,20 +104,29 @@ async function tracked<T extends { usage: Usage }>(
 ): Promise<T> {
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
+  const root = isTraceRoot();
   try {
-    const result = await run(model);
+    const result = await labelled(info, () => run(model));
     await logCall(row(true, result.usage));
     return result;
   } catch (error) {
     if (!(error instanceof AiNotConfiguredError)) await logCall(row(false));
     throw error;
+  } finally {
+    // A call inside a bigger trace is sent when that trace ends.
+    if (root) await flushLangfuse();
   }
 }
+
+/** Names the call in Langfuse after its feature. */
+const named = (info: Pick<CallInfo, "feature">) => ({
+  telemetry: { functionId: info.feature },
+});
 
 /** Generates text. Example: callText({ module: 3, feature: "support-answer" }, { prompt }) */
 export async function callText(info: CallInfo, options: TextOptions) {
   return tracked(info, (model) =>
-    generateText({ ...options, model: languageModel(model) }),
+    generateText({ ...named(info), ...options, model: languageModel(model) }),
   );
 }
 
@@ -126,6 +138,7 @@ export async function callObject<Schema extends z.ZodType>(
   const { schema, ...rest } = options;
   const result = await tracked(info, (model) =>
     generateText({
+      ...named(info),
       ...rest,
       model: languageModel(model),
       output: Output.object({ schema }),
@@ -158,19 +171,25 @@ export async function callEmbedMany(
       ok,
       created_at: new Date().toISOString(),
     });
+  const root = isTraceRoot();
   try {
-    const result = await embedMany({
-      model: google().embedding(EMBEDDING_MODEL.slice("google/".length)),
-      values,
-      providerOptions: {
-        google: { outputDimensionality: EMBEDDING_DIMENSIONS },
-      },
-    });
+    const result = await labelled(info, () =>
+      embedMany({
+        ...named(info),
+        model: google().embedding(EMBEDDING_MODEL.slice("google/".length)),
+        values,
+        providerOptions: {
+          google: { outputDimensionality: EMBEDDING_DIMENSIONS },
+        },
+      }),
+    );
     await log(true);
     return result;
   } catch (error) {
     if (!(error instanceof AiNotConfiguredError)) await log(false);
     throw error;
+  } finally {
+    if (root) await flushLangfuse();
   }
 }
 
@@ -187,12 +206,20 @@ type StreamOptions = DistributiveOmit<
 export function callStream(info: CallInfo, options: StreamOptions) {
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
-  return streamText({
-    ...options,
-    model: languageModel(model),
-    onFinish: ({ totalUsage }) => logCall(row(true, totalUsage)),
-    onError: () => logCall(row(false)),
-  });
+  const root = isTraceRoot();
+  const finish = async (ok: boolean, usage?: Usage) => {
+    await logCall(row(ok, usage));
+    if (root) void flushLangfuse();
+  };
+  return labelled(info, () =>
+    streamText({
+      ...named(info),
+      ...options,
+      model: languageModel(model),
+      onFinish: ({ totalUsage }) => finish(true, totalUsage),
+      onError: () => finish(false),
+    }),
+  );
 }
 
 // Asking for some thinking (rather than letting the model decide) is what
