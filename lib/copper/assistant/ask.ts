@@ -9,6 +9,7 @@
 // conversation.
 import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
+import { traced } from "@/lib/ai/langfuse";
 import { createLive, type Live } from "@/lib/ai/live";
 import {
   COPPER_INSTRUCTIONS,
@@ -121,55 +122,63 @@ export async function askCopper({
     return handoff;
   }
 
-  // Without tools, send no instructions either: "always use your tools" with
-  // no tools makes the model answer with nothing.
-  const copper = callStream(
-    { module: 2, feature: "ask-copper" },
-    {
-      messages,
-      providerOptions: THOUGHT_SUMMARIES,
-      ...(useTools && {
-        instructions: COPPER_INSTRUCTIONS,
-        tools: copperTools,
-        // A handoff ends Copper's turn: the Refund Desk answers.
-        stopWhen: [stepCountIs(MAX_STEPS), hasToolCall("handoff_to_refunds")],
-      }),
-    },
-  );
-
   // Read the stream in the background, so the panel gets the first update now.
-  void (async () => {
-    try {
-      const handoff = await follow("copper", copper);
-      if (handoff !== undefined) {
-        progress.steps.push({
-          type: "handoff",
-          to: "refund-desk",
-          summary: handoff,
-        });
-        progress.agent = "refund-desk";
-        progress.reply = "";
-        update(snapshot());
-        const desk = callStream(
-          { module: 4, feature: "refund-desk" },
+  // One Langfuse trace per turn: Copper, and the Refund Desk after a handoff.
+  void traced(
+    "ask-copper-turn",
+    messages.at(-1)?.content,
+    async (setOutput) => {
+      try {
+        // Without tools, send no instructions either: "always use your tools" with
+        // no tools makes the model answer with nothing.
+        const copper = callStream(
+          { module: 2, feature: "ask-copper" },
           {
             messages,
             providerOptions: THOUGHT_SUMMARIES,
-            instructions: `${REFUND_DESK_INSTRUCTIONS}\n\nCopper's handoff note: ${handoff}`,
-            tools: refundDeskTools,
-            stopWhen: stepCountIs(MAX_STEPS),
+            ...(useTools && {
+              instructions: COPPER_INSTRUCTIONS,
+              tools: copperTools,
+              // A handoff ends Copper's turn: the Refund Desk answers.
+              stopWhen: [
+                stepCountIs(MAX_STEPS),
+                hasToolCall("handoff_to_refunds"),
+              ],
+            }),
           },
         );
-        await follow("refund-desk", desk);
+        const handoff = await follow("copper", copper);
+        if (handoff !== undefined) {
+          progress.steps.push({
+            type: "handoff",
+            to: "refund-desk",
+            summary: handoff,
+          });
+          progress.agent = "refund-desk";
+          progress.reply = "";
+          update(snapshot());
+          const desk = callStream(
+            { module: 4, feature: "refund-desk" },
+            {
+              messages,
+              providerOptions: THOUGHT_SUMMARIES,
+              instructions: `${REFUND_DESK_INSTRUCTIONS}\n\nCopper's handoff note: ${handoff}`,
+              tools: refundDeskTools,
+              stopWhen: stepCountIs(MAX_STEPS),
+            },
+          );
+          await follow("refund-desk", desk);
+        }
+        progress.status = "done";
+        if (!progress.reply.trim()) progress.reply = SORRY;
+      } catch {
+        progress.status = "error";
+        if (!progress.reply.trim()) progress.reply = SORRY;
       }
-      progress.status = "done";
-      if (!progress.reply.trim()) progress.reply = SORRY;
-    } catch {
-      progress.status = "error";
-      if (!progress.reply.trim()) progress.reply = SORRY;
-    }
-    done(snapshot());
-  })();
+      setOutput(progress.reply);
+      done(snapshot());
+    },
+  );
 
   return { progress: live };
 }
